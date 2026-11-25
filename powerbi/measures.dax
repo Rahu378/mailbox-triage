@@ -1,0 +1,42 @@
+// Measures for the Middle Office Mailbox report. Source: the vw_* views in sql/views.sql (PostgreSQL connector).
+
+Emails Received = COUNTROWS ( vw_triage )
+
+Tickets Opened =
+CALCULATE ( [Emails Received], vw_triage[route] = "JIRA" )
+
+Auto-handled % =
+DIVIDE ( CALCULATE ( [Emails Received], vw_triage[route] IN { "JIRA", "FYI" } ), [Emails Received] )
+
+Human Review Rate =
+DIVIDE ( CALCULATE ( [Emails Received], vw_triage[route] = "HUMAN_REVIEW" ), [Emails Received] )
+
+SSI Call-backs =
+CALCULATE ( [Emails Received], vw_triage[route] = "SSI_CALLBACK" )
+
+T+1 At Risk =
+CALCULATE (
+    [Emails Received],
+    vw_triage[route] = "JIRA",
+    vw_triage[priority] IN { "Highest", "High" },
+    vw_triage[category] IN { "SETTLEMENT_FAIL", "TRADE_QUERY" }
+)
+
+Fails Due Or Past Due = SUM ( vw_counterparty_fails[due_or_past_due] )
+
+Median Triage Latency (ms) = MEDIAN ( vw_triage[latency_ms] )
+
+Open SSI Call-backs =
+CALCULATE ( SUM ( vw_open_queues[open_items] ), vw_open_queues[queue] = "SSI call-back" )
+
+Open Human Review =
+CALCULATE ( SUM ( vw_open_queues[open_items] ), vw_open_queues[queue] = "Human review" )
+
+Drafts Awaiting Approval =
+CALCULATE ( SUM ( vw_open_queues[open_items] ), vw_open_queues[queue] = "Drafts awaiting approval" )
+
+Median Minutes To Approve = MEDIAN ( vw_draft_turnaround[minutes_to_approve] )
+
+// needs the 'Date' table from powerbi/README.md, related to vw_triage[received_day]
+Auto-handled % (prev day) =
+CALCULATE ( [Auto-handled %], DATEADD ( 'Date'[Date], -1, DAY ) )
