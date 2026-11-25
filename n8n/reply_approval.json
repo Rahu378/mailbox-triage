@@ -1,0 +1,272 @@
+{
+  "name": "Middle office reply approval",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "mo-approve-draft",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "48e1afe7-fa68-5827-8944-edd6f880f5c7",
+      "name": "Approval webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "mo-approvals",
+          "name": "Approval UI token"
+        }
+      },
+      "webhookId": "08f85e91-9693-58b9-9acb-1d8c8dfab82e"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reply_drafts\nSET status = 'APPROVED', approved_by = $2, approved_at = now(), draft = COALESCE(NULLIF($3, ''), draft)\nWHERE email_id = $1 AND status = 'PENDING_APPROVAL'\nRETURNING email_id, draft",
+        "options": {
+          "queryReplacement": "={{ [$json.body.email_id, $json.body.approver, $json.body.draft || ''] }}"
+        }
+      },
+      "id": "2c3e1018-37fc-5030-8959-55b3bab97818",
+      "name": "Approve draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "dca058df-40c8-5909-a6fb-a184990e42f4",
+              "leftValue": "={{ $json.email_id }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0e88955b-16c3-5120-aeed-cfda471b4d6b",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT from_addr, subject FROM emails WHERE email_id = $1",
+        "options": {
+          "queryReplacement": "={{ [$json.email_id] }}"
+        }
+      },
+      "id": "f4451031-9147-5d36-b686-868d3d353fb5",
+      "name": "Original email",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "middle.office@harborpeak.example",
+        "toEmail": "={{ $json.from_addr }}",
+        "subject": "=RE: {{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $('Approve draft').item.json.draft }}",
+        "options": {}
+      },
+      "id": "9e48dbc9-b4f5-52fe-8016-9a9ed5422d2e",
+      "name": "Send approved reply",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        880,
+        200
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mo-smtp",
+          "name": "Internal SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reply_drafts SET status = 'SENT', sent_at = now()\nWHERE email_id = $1 AND status = 'APPROVED'",
+        "options": {
+          "queryReplacement": "={{ [$('Approve draft').item.json.email_id] }}"
+        }
+      },
+      "id": "ea3fd76f-d473-5011-8220-c4620f0bffd3",
+      "name": "Mark sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'sent', email_id: $('Approve draft').item.json.email_id } }}",
+        "options": {}
+      },
+      "id": "ba0efd5e-382c-5dff-89ed-246ab85b68b8",
+      "name": "Respond: sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'not_found_or_already_handled' } }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "0cb0473a-d4f1-552c-bf64-366197cc91cf",
+      "name": "Respond: nothing to approve",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Approval webhook": {
+      "main": [
+        [
+          {
+            "node": "Approve draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve draft": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Original email": {
+      "main": [
+        [
+          {
+            "node": "Send approved reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send approved reply": {
+      "main": [
+        [
+          {
+            "node": "Mark sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark sent": {
+      "main": [
+        [
+          {
+            "node": "Respond: sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Original email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: nothing to approve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "middle-office"
+    }
+  ]
+}
