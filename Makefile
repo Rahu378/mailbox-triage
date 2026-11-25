@@ -1,4 +1,4 @@
-.PHONY: mailbox bench test workflow site e2e
+.PHONY: mailbox bench test workflow site e2e pages
 
 mailbox:
 	python -m triage.mailbox
@@ -17,3 +17,9 @@ site:
 
 e2e:
 	./n8n/e2e/run_e2e.sh
+
+# the Pages site is served from the gh-pages branch, a copy of docs/
+pages:
+	git subtree split --prefix docs -b gh-pages-tmp
+	git push -f origin gh-pages-tmp:gh-pages
+	git branch -D gh-pages-tmp
