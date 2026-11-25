@@ -1,0 +1,718 @@
+{
+  "name": "Middle office mailbox triage",
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "read",
+        "format": "simple",
+        "options": {}
+      },
+      "id": "3af9c21e-cfcc-552f-8ba2-44d96153ec44",
+      "name": "Shared mailbox (IMAP)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "imap": {
+          "id": "mo-imap",
+          "name": "Middle office mailbox"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// IMAP trigger output (\"simple\" format) -> the email shape everything else uses.\nconst j = $json;\nconst fromText = (j.from && (j.from.text || j.from.value?.[0]?.address || j.from)) || \"\";\nconst m = String(fromText).match(/^\\s*\"?(.*?)\"?\\s*<([^>]+)>\\s*$/);\nconst strip = (html) => String(html || \"\")\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, \"\")\n  .replace(/<br\\s*\\/?>/gi, \"\\n\").replace(/<\\/p>/gi, \"\\n\")\n  .replace(/<[^>]+>/g, \"\").replace(/&nbsp;/g, \" \").replace(/&amp;/g, \"&\");\nconst body = (j.textPlain || strip(j.textHtml) || \"\").replace(/\\r\\n/g, \"\\n\").trim();\nreturn {\n  json: {\n    email_id: j.messageId || j.metadata?.[\"message-id\"] || `IMAP-${$execution.id}-${$itemIndex}`,\n    received_at: new Date(j.date || Date.now()).toISOString(),\n    from_name: m ? m[1] : \"\",\n    from_addr: (m ? m[2] : String(fromText)).trim().toLowerCase(),\n    subject: j.subject || \"\",\n    body: body.slice(0, 20000),\n    attachments: (j.attachments || []).map((a) => a.filename).filter(Boolean),\n  },\n};\n"
+      },
+      "id": "211c14b8-8191-5eeb-9933-46828feda4aa",
+      "name": "Normalize email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// One structured-output call: category + fields, strict JSON schema.\nconst SYSTEM = \"You triage the middle-office shared mailbox of an asset manager (Harbor Peak Asset Management).\\nRead one email and return the JSON the schema asks for. Nothing else.\\n\\nCategories\\n- TRADE_QUERY: a question or mismatch about a specific trade: quantity, price, allocation, account, commission, confirm/affirm.\\n- SETTLEMENT_FAIL: a trade that failed, is failing, is short, or hasn't settled on its contractual date.\\n- SSI_UPDATE: anything about standing settlement instructions, bank or wire details, custodian or agent changes.\\n- CA_ELECTION: a corporate action that needs a decision: tender, rights, exchange, consent, dividend reinvestment.\\n- PRICE_CHALLENGE: someone thinks a price or mark is wrong or stale and wants it challenged.\\n- OTHER: out-of-office replies, newsletters, invites, thank-you notes, anything with no action for middle office.\\n\\nRead it the way an experienced ops analyst would:\\n- An automatic reply is OTHER even if it quotes a fail notice.\\n- A forwarded email is about the forwarded content. The counterparty is the original sender's firm, not the colleague who forwarded it.\\n- \\\"Before this turns into a fail\\\" in a question about an allocation is a TRADE_QUERY, not a fail.\\n- If an email asks us to change where money or securities go (new account, new bank, new agent, new SSIs), set\\n  ssi_change_detected to true, whatever the category. This includes changes slipped into the end of an unrelated email.\\n\\nFields\\n- trade_ids: references like T7364412, in the order they appear. [] if none.\\n- cusip / isin: exactly as written. Don't invent one from a ticker. null if absent.\\n- quantity: an integer number of shares or units (\\\"1.5mm\\\" = 1500000, \\\"25k\\\" = 25000). The first quantity that refers to\\n  our side of the trade. null if absent.\\n- settlement_date: YYYY-MM-DD. Resolve \\\"today\\\", \\\"tomorrow\\\", \\\"T+1\\\" and weekday names against the received date.\\n  US settlement is T+1. Thursday 26 Nov 2026 is a holiday.\\n- deadline: YYYY-MM-DD for election or response deadlines, otherwise null.\\n- counterparty: the broker or custodian on the other side, as a firm name. null if none (e.g. internal price challenges).\\n- confidence: 0 to 1, how sure you are of the category. Use below 0.75 when a person should look at it.\\n- summary: one sentence. requested_action: what they want us to do, in a few words.\\n\";\nconst SCHEMA = {\"type\": \"object\", \"additionalProperties\": false, \"required\": [\"category\", \"confidence\", \"trade_ids\", \"cusip\", \"isin\", \"quantity\", \"settlement_date\", \"deadline\", \"counterparty\", \"ssi_change_detected\", \"summary\", \"requested_action\"], \"properties\": {\"category\": {\"type\": \"string\", \"enum\": [\"TRADE_QUERY\", \"SETTLEMENT_FAIL\", \"SSI_UPDATE\", \"CA_ELECTION\", \"PRICE_CHALLENGE\", \"OTHER\"]}, \"confidence\": {\"type\": \"number\", \"description\": \"0 to 1\"}, \"trade_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"cusip\": {\"type\": [\"string\", \"null\"]}, \"isin\": {\"type\": [\"string\", \"null\"]}, \"quantity\": {\"type\": [\"integer\", \"null\"]}, \"settlement_date\": {\"type\": [\"string\", \"null\"], \"description\": \"YYYY-MM-DD\"}, \"deadline\": {\"type\": [\"string\", \"null\"], \"description\": \"YYYY-MM-DD, for corporate action elections\"}, \"counterparty\": {\"type\": [\"string\", \"null\"]}, \"ssi_change_detected\": {\"type\": \"boolean\"}, \"summary\": {\"type\": \"string\"}, \"requested_action\": {\"type\": \"string\"}}};\nconst e = $json;\nreturn {\n  json: {\n    ...e,\n    openai_request: {\n      model: \"gpt-4o-mini\",\n      temperature: 0,\n      response_format: { type: \"json_schema\", json_schema: { name: \"triage\", strict: true, schema: SCHEMA } },\n      messages: [\n        { role: \"system\", content: SYSTEM },\n        { role: \"user\", content: `Received: ${e.received_at}\\nFrom: ${e.from_name} <${e.from_addr}>\\nSubject: ${e.subject}\\n\\n${e.body}` },\n      ],\n    },\n  },\n};\n"
+      },
+      "id": "94660fcf-2b55-5670-a609-f1b8444a2663",
+      "name": "Build OpenAI request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.openai_request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "e47ca220-ea13-5841-9386-17eff54bc646",
+      "name": "OpenAI: classify + extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openAiApi",
+          "name": "OpenAI"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse the model's JSON, then apply the controls. Same rules as triage/controls.py (checked by n8n/code/controls.test.js).\n// Controls for the n8n \"Parse + controls\" Code node. JS twin of triage/controls.py.\n// Pure functions only, so node --test can check them against fixtures from the Python side.\n// n8n/build.py pastes this file into the workflow JSON, so there are no imports here.\n\nconst HOLIDAYS = new Set([\n  \"2026-01-01\", \"2026-01-19\", \"2026-02-16\", \"2026-05-25\", \"2026-06-19\", \"2026-07-03\",\n  \"2026-09-07\", \"2026-10-12\", \"2026-11-11\", \"2026-11-26\", \"2026-12-25\",\n]);\nconst KNOWN_ORGS = {\n  \"halden-sec.example\": \"Halden Securities\", \"northgatecm.example\": \"Northgate Capital Markets\",\n  \"kestrelprime.example\": \"Kestrel Prime\", \"oakmontlowe.example\": \"Oakmont & Lowe\",\n  \"sablestreet.example\": \"Sable Street Partners\", \"marlowexec.example\": \"Marlow Agency Execution\",\n  \"meridiancustody.example\": \"Meridian Custody\", \"atlastrust.example\": \"Atlas Trust\",\n};\nconst CATEGORIES = [\"TRADE_QUERY\", \"SETTLEMENT_FAIL\", \"SSI_UPDATE\", \"CA_ELECTION\", \"PRICE_CHALLENGE\", \"OTHER\"];\nconst REQUIRED = {\n  SETTLEMENT_FAIL: [[\"trade_ids\", \"trade ID\"], [\"settlement_date\", \"settlement date\"]],\n  TRADE_QUERY: [[\"trade_ids\", \"trade ID\"]],\n  CA_ELECTION: [[\"deadline\", \"election deadline\"]],\n  PRICE_CHALLENGE: [],\n};\n\nconst iso = (d) => d.toISOString().slice(0, 10);\nconst day = (s) => new Date(`${String(s).slice(0, 10)}T00:00:00Z`);\n\nfunction isBusinessDay(d) {\n  const wd = d.getUTCDay();\n  return wd !== 0 && wd !== 6 && !HOLIDAYS.has(iso(d));\n}\n\nfunction bdaysBetween(a, b) {\n  if (iso(a) === iso(b)) return 0;\n  const sign = b > a ? 1 : -1;\n  let [x, y] = sign === 1 ? [a, b] : [b, a];\n  let n = 0;\n  const d = new Date(x);\n  while (d < y) {\n    d.setUTCDate(d.getUTCDate() + 1);\n    if (isBusinessDay(d)) n += 1;\n  }\n  return sign * n;\n}\n\nfunction settlementUrgency(receivedIso, settleIso) {\n  if (!settleIso) return [\"Medium\", null];\n  const gap = bdaysBetween(day(receivedIso), day(settleIso));\n  if (gap <= 0) return [\"Highest\", gap];\n  if (gap === 1) return [\"High\", gap];\n  if (gap === 2) return [\"Medium\", gap];\n  return [\"Low\", gap];\n}\n\nfunction cusipValid(c) {\n  if (!/^[0-9A-Z]{9}$/.test(c || \"\")) return false;\n  let total = 0;\n  for (let i = 0; i < 8; i++) {\n    const ch = c[i];\n    let v = /\\d/.test(ch) ? Number(ch) : ch.charCodeAt(0) - 55;\n    if (i % 2 === 1) v *= 2;\n    total += Math.floor(v / 10) + (v % 10);\n  }\n  return (10 - (total % 10)) % 10 === Number(c[8]);\n}\n\nfunction isinValid(s) {\n  if (!/^[A-Z]{2}[0-9A-Z]{9}[0-9]$/.test(s || \"\")) return false;\n  const digits = s.slice(0, 11).split(\"\").map((ch) => parseInt(ch, 36).toString()).join(\"\");\n  let total = 0;\n  digits.split(\"\").reverse().forEach((ch, i) => {\n    let d = Number(ch);\n    if (i % 2 === 0) { d *= 2; if (d > 9) d -= 9; }\n    total += d;\n  });\n  return (10 - (total % 10)) % 10 === Number(s[11]);\n}\n\nfunction editDistance(a, b) {\n  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);\n  for (let i = 1; i <= a.length; i++) {\n    const cur = [i];\n    for (let j = 1; j <= b.length; j++) {\n      cur.push(Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] !== b[j - 1] ? 1 : 0)));\n    }\n    prev = cur;\n  }\n  return prev[b.length];\n}\n\nfunction lookalikeOf(domain) {\n  for (const [known, org] of Object.entries(KNOWN_ORGS)) {\n    if (domain !== known && editDistance(domain, known) <= 2) return org;\n  }\n  return null;\n}\n\nconst SSI_CHANGE = new RegExp(\n  \"(?:new|updated?|chang(?:e|ed|es)|moved|amended)\\\\b[^.\\\\n]{0,40}\\\\b(?:bank details|account number|settlement account|\"\n  + \"wire instructions|settlement instructions|ssis?|beneficiary|payment details|bank account)|\"\n  + \"(?:bank details|settlement instructions|ssis?|wire instructions|bank account)\\\\b[^.\\\\n]{0,40}\\\\b(?:have changed|changed|\"\n  + \"change effective|update|updated|are changing)\", \"i\");\n\nfunction detectSsiChange(subject, body) {\n  const text = `${subject}\\n${body}`;\n  const reasons = [];\n  if (SSI_CHANGE.test(text)) reasons.push(\"asks to change settlement / bank details\");\n  if (/\\b(?:ABA|SWIFT|BIC|IBAN)\\b/.test(text) && /\\baccount\\b/i.test(text)) reasons.push(\"contains bank routing details\");\n  if (/switched (?:custodians?|banks?|agents?)|new (?:custodian|agent|bank)\\b|(?:going forward|from (?:now|monday|today)).{0,60}\\b(?:send|pay|wire|deliver|remit)\\b/i.test(text)\n      && /\\b(?:acct|account|a\\/c)\\b/i.test(text)) {\n    reasons.push(\"redirects payments or deliveries to a new account\");\n  }\n  return reasons;\n}\n\nfunction validate(ex, receivedIso) {\n  const errs = [];\n  for (const t of ex.trade_ids || []) if (!/^T\\d{7}$/.test(t)) errs.push(`trade ID ${t} isn't in our format`);\n  if (ex.cusip && !cusipValid(ex.cusip)) errs.push(`CUSIP ${ex.cusip} fails the check digit`);\n  if (ex.isin && !isinValid(ex.isin)) errs.push(`ISIN ${ex.isin} fails the check digit`);\n  if ([\"SETTLEMENT_FAIL\", \"TRADE_QUERY\", \"CA_ELECTION\", \"PRICE_CHALLENGE\"].includes(ex.category) && !(ex.cusip || ex.isin)) {\n    errs.push(\"no security identifier\");\n  }\n  for (const [key, label] of [[\"settlement_date\", \"settlement date\"], [\"deadline\", \"deadline\"]]) {\n    const v = ex[key];\n    if (!v) continue;\n    if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(v) || Number.isNaN(day(v).getTime())) { errs.push(`${label} '${v}' isn't a date`); continue; }\n    const d = day(v);\n    if (!isBusinessDay(d)) errs.push(`${label} ${v} isn't a business day`);\n    if (Math.abs(bdaysBetween(day(receivedIso), d)) > 10) errs.push(`${label} ${v} is more than 10 business days from today`);\n  }\n  if (ex.quantity !== null && ex.quantity !== undefined && !(ex.quantity > 0 && ex.quantity < 1e9)) {\n    errs.push(`quantity ${ex.quantity} looks wrong`);\n  }\n  for (const [key, label] of REQUIRED[ex.category] || []) {\n    const v = ex[key];\n    if (!v || (Array.isArray(v) && !v.length)) errs.push(`missing ${label}`);\n  }\n  return errs;\n}\n\nfunction decide(email, ex, floor = 0.75) {\n  const flags = detectSsiChange(email.subject, email.body);\n  const senderDomain = String(email.from_addr).split(\"@\").pop();\n  const look = lookalikeOf(senderDomain);\n  if (look) flags.push(`sender domain ${senderDomain} is a look-alike of ${look}`);\n  if (ex.category === \"SSI_UPDATE\") flags.unshift(\"classified as an SSI update\");\n  if (ex.ssi_change_detected && !flags.length) flags.push(\"extractor flagged a settlement-instruction change\");\n  if (flags.length) {\n    return { route: \"SSI_CALLBACK\", priority: \"Highest\", sla_gap_bdays: null, ssi_flags: flags, validation_errors: [],\n             reasons: [\"Possible change to settlement or bank details\", \"Call back on the number in static data, not anything in this email\"] };\n  }\n  const errs = validate(ex, email.received_at);\n  if (ex.category === \"OTHER\" && ex.confidence >= floor) {\n    return { route: \"FYI\", priority: null, sla_gap_bdays: null, reasons: [\"No action needed\"], validation_errors: [], ssi_flags: [] };\n  }\n  if (ex.confidence < floor || errs.length) {\n    const why = ex.confidence < floor ? [`confidence ${ex.confidence.toFixed(2)} below ${floor.toFixed(2)}`] : [];\n    return { route: \"HUMAN_REVIEW\", priority: null, sla_gap_bdays: null, reasons: why.concat(errs), validation_errors: errs, ssi_flags: [] };\n  }\n  let p, gap, why;\n  if (ex.category === \"SETTLEMENT_FAIL\") {\n    [p, gap] = settlementUrgency(email.received_at, ex.settlement_date);\n    p = p === \"Highest\" ? \"Highest\" : \"High\";\n    why = \"Fail: at least High, Highest once it's due\";\n  } else if (ex.category === \"CA_ELECTION\") {\n    [p, gap] = settlementUrgency(email.received_at, ex.deadline);\n    p = [\"Highest\", \"High\"].includes(p) ? p : \"Medium\";\n    why = \"Election: driven by the response deadline\";\n  } else if (ex.category === \"PRICE_CHALLENGE\") {\n    [p, gap] = [\"Medium\", null];\n    why = \"Price challenge: before the next NAV strike\";\n  } else {\n    [p, gap] = settlementUrgency(email.received_at, ex.settlement_date);\n    why = \"T+1: priority from business days to settlement\";\n  }\n  return { route: \"JIRA\", priority: p, sla_gap_bdays: gap, reasons: [why], validation_errors: [], ssi_flags: [] };\n}\n\n\nconst email = $(\"Build OpenAI request\").item.json;\nlet ex;\ntry {\n  const msg = $json.choices[0].message;\n  if (msg.refusal) throw new Error(`model refused: ${msg.refusal}`);\n  ex = JSON.parse(msg.content);\n} catch (err) {\n  // no usable answer -> confidence 0 -> a person looks at it (or the SSI check still catches it)\n  ex = { category: \"OTHER\", confidence: 0, trade_ids: [], cusip: null, isin: null, quantity: null, settlement_date: null,\n         deadline: null, counterparty: null, ssi_change_detected: false, summary: \"\", requested_action: \"\",\n         error: String(err.message || err) };\n}\n// second opinion on bank details, whatever the model said\nex.ssi_change_detected = Boolean(ex.ssi_change_detected) || detectSsiChange(email.subject, email.body).length > 0;\nconst decision = decide(email, ex, 0.75);\nreturn { json: { email, extraction: ex, decision, route: decision.route } };\n"
+      },
+      "id": "41185888-e527-516b-9a79-82d5a27d7cf0",
+      "name": "Parse + controls",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH e AS (\n  INSERT INTO emails (email_id, received_at, from_name, from_addr, subject, body)\n  VALUES ($1, $2::timestamptz, $3, $4, $5, $6)\n  ON CONFLICT (email_id) DO NOTHING\n)\nINSERT INTO triage_results (email_id, extractor, category, confidence, trade_ids, cusip, isin, quantity,\n  settlement_date, deadline, counterparty, route, priority, sla_gap_bdays, reasons, validation_errors, ssi_flags)\nVALUES ($1, 'openai', $7, $8, $9::jsonb, $10, $11, $12, $13::date, $14::date, $15, $16, $17, $18, $19::jsonb,\n  $20::jsonb, $21::jsonb)\nON CONFLICT (email_id) DO NOTHING",
+        "options": {
+          "queryReplacement": "={{ [$json.email.email_id, $json.email.received_at, $json.email.from_name, $json.email.from_addr, $json.email.subject, $json.email.body, $json.extraction.category, $json.extraction.confidence, JSON.stringify($json.extraction.trade_ids || []), $json.extraction.cusip, $json.extraction.isin, $json.extraction.quantity, $json.extraction.settlement_date, $json.extraction.deadline, $json.extraction.counterparty, $json.decision.route, $json.decision.priority, $json.decision.sla_gap_bdays, JSON.stringify($json.decision.reasons), JSON.stringify($json.decision.validation_errors), JSON.stringify($json.decision.ssi_flags)] }}"
+        }
+      },
+      "id": "8558b767-2bf4-5db4-ab3d-0462f6cedb99",
+      "name": "Save triage result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "800db539-8e22-5514-b766-74332c95c9d2",
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "JIRA"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Jira"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "08d52bbe-5f15-528c-9640-2fdf3d588cf1",
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "SSI_CALLBACK"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "SSI call-back"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "46ac8088-4ac4-51d5-95f4-c59417790d6c",
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "HUMAN_REVIEW"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Human review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "f29c3d03-e7f0-5653-81a4-0a0ac4b73a2f",
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "FYI"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "FYI"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6849f1aa-aebd-5bc3-a085-e4c2c54c7804",
+      "name": "Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Jira Cloud v3 issue + the JQL that finds an open ticket for the same trade (so follow-ups become comments).\n// Your Jira site. The HTTP nodes downstream read it from here (n8n 2.x blocks $env in nodes by default).\nconst JIRA_BASE_URL = \"https://your-site.atlassian.net\";\nconst { email, extraction: ex, decision } = $json;  // input comes straight from Route\nconst LABEL = { TRADE_QUERY: \"trade-query\", SETTLEMENT_FAIL: \"settlement-fail\", CA_ELECTION: \"ca-election\", PRICE_CHALLENGE: \"price-challenge\" };\nconst PREFIX = { TRADE_QUERY: \"Query\", SETTLEMENT_FAIL: \"FAIL\", CA_ELECTION: \"Election\", PRICE_CHALLENGE: \"Price\" };\nconst ref = (ex.trade_ids || []).join(\", \") || ex.cusip || ex.isin || \"no ref\";\nconst bits = [PREFIX[ex.category], ref];\nif (ex.quantity) bits.push(Number(ex.quantity).toLocaleString(\"en-US\"));\nif (ex.settlement_date) bits.push(`SD ${ex.settlement_date}`);\nif (ex.deadline) bits.push(`deadline ${ex.deadline}`);\nif (ex.counterparty) bits.push(ex.counterparty);\nconst refKey = (ex.trade_ids || [])[0] || ex.cusip || ex.isin || null;\nconst labels = [\"mailbox-triage\", LABEL[ex.category], ...(ex.trade_ids || []).map((t) => `trade-${t}`)];\nif (refKey) labels.push(`ref-${refKey}`);\nif ([\"Highest\", \"High\"].includes(decision.priority) && [\"SETTLEMENT_FAIL\", \"TRADE_QUERY\"].includes(ex.category)) labels.push(\"t1-at-risk\");\nconst para = (t) => ({ type: \"paragraph\", content: [{ type: \"text\", text: t }] });\nconst issue = {\n  fields: {\n    project: { key: \"MO\" },\n    issuetype: { name: \"Task\" },\n    summary: bits.join(\" | \").slice(0, 250),\n    priority: { name: decision.priority },\n    labels,\n    description: { type: \"doc\", version: 1, content: [\n      para(`From ${email.from_name} <${email.from_addr}> at ${email.received_at}`),\n      para(`Subject: ${email.subject}`),\n      para(`Trade IDs: ${ref} | CUSIP: ${ex.cusip || \"-\"} | ISIN: ${ex.isin || \"-\"} | Qty: ${ex.quantity || \"-\"} | Settlement: ${ex.settlement_date || \"-\"} | Deadline: ${ex.deadline || \"-\"} | Counterparty: ${ex.counterparty || \"-\"}`),\n      para(`Why this priority: ${decision.reasons.join(\"; \")}`),\n      para(`Model confidence ${Number(ex.confidence).toFixed(2)}. Email id ${email.email_id}.`),\n    ] },\n  },\n};\nif (ex.settlement_date || ex.deadline) issue.fields.duedate = ex.settlement_date || ex.deadline;\n// one open ticket per (category, trade or security): a follow-up email becomes a comment\nconst jql = refKey\n  ? `project = MO AND labels = \"mailbox-triage\" AND labels = \"${LABEL[ex.category]}\" AND labels = \"ref-${refKey}\" AND statusCategory != Done`\n  : `project = MO AND labels = \"__no_dedupe__\"`;\nreturn { json: { ...$json, issue, jql, jira_base_url: JIRA_BASE_URL.replace(/\\/$/, \"\") } };\n"
+      },
+      "id": "59c40e10-65ef-5599-b2b6-4bf8ee50dec4",
+      "name": "Build Jira payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.jira_base_url }}/rest/api/3/search/jql",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ jql: $json.jql, fields: ['key'], maxResults: 1 }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "6fdc0dbe-8c50-5077-a80b-9bc21f153c04",
+      "name": "Jira: find open ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        60
+      ],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "jiraSoftwareCloudApi",
+          "name": "Jira"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "61ce15a8-6351-5a29-98be-22624ef413ba",
+              "leftValue": "={{ ($json.issues || []).length }}",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "rightValue": 0
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "25382885-407b-5684-a49c-5e980cf78e62",
+      "name": "Already open?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Build Jira payload').item.json.jira_base_url }}/rest/api/3/issue/{{ $json.issues[0].key }}/comment",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Follow-up email ' + $('Build Jira payload').item.json.email.email_id + ' from ' + $('Build Jira payload').item.json.email.from_addr + ': ' + $('Build Jira payload').item.json.email.subject }] }] } }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "4036e7f4-98c4-58c0-a338-a8cf1a456e42",
+      "name": "Jira: add comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        -40
+      ],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "jiraSoftwareCloudApi",
+          "name": "Jira"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Build Jira payload').item.json.jira_base_url }}/rest/api/3/issue",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Jira payload').item.json.issue) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "8f8f227d-e902-5624-a960-2a36ba28c5b1",
+      "name": "Jira: create issue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        160
+      ],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "jiraSoftwareCloudApi",
+          "name": "Jira"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Ask for a reply draft. It is stored as PENDING_APPROVAL and nothing sends it until an analyst approves.\nconst SYSTEM = \"You draft replies for the middle-office team at Harbor Peak Asset Management. An analyst reads every draft before it\\ngoes anywhere, so write something they can approve as-is.\\n\\nRules\\n- Three to five short sentences. Plain, polite, no filler.\\n- Quote the trade ID or security and any date that matters. Never invent facts that aren't in the case notes.\\n- Never confirm, repeat or acknowledge bank details, account numbers or settlement instructions.\\n- Never promise a time you weren't given. \\\"We'll come back to you before the cut-off\\\" is fine.\\n- Sign off as \\\"Middle Office, Harbor Peak Asset Management\\\".\\n\";\nconst base = $(\"Build Jira payload\").item.json;\nconst ticket = $json.key || $json.issues?.[0]?.key || $(\"Already open?\").item.json.issues?.[0]?.key || null;\nconst ex = base.extraction;\nconst notes = [\n  `Category: ${ex.category}`,\n  `Trade IDs: ${(ex.trade_ids || []).join(\", \") || \"-\"}`,\n  `Security: ${ex.cusip || ex.isin || \"-\"}`,\n  `Quantity: ${ex.quantity ?? \"-\"}`,\n  `Settlement date: ${ex.settlement_date || \"-\"}`,\n  `Deadline: ${ex.deadline || \"-\"}`,\n  `Our ticket: ${ticket || \"-\"}`,\n  `Their email (from ${base.email.from_name}):\\n${base.email.body.slice(0, 4000)}`,\n].join(\"\\n\");\nreturn {\n  json: {\n    email_id: base.email.email_id,\n    jira_key: ticket,\n    openai_request: {\n      model: \"gpt-4o-mini\",\n      temperature: 0.2,\n      messages: [{ role: \"system\", content: SYSTEM }, { role: \"user\", content: notes }],\n    },\n  },\n};\n"
+      },
+      "id": "0d91242e-4a5a-5b9e-8098-3eafb99135e1",
+      "name": "Build draft request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.openai_request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "3145a329-6899-5ad0-b0f0-b732ec9baffa",
+      "name": "OpenAI: draft reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2440,
+        60
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openAiApi",
+          "name": "OpenAI"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH t AS (\n  UPDATE triage_results SET jira_key = $2 WHERE email_id = $1\n)\nINSERT INTO reply_drafts (email_id, jira_key, draft, status)\nVALUES ($1, $2, $3, 'PENDING_APPROVAL')\nON CONFLICT (email_id) DO NOTHING",
+        "options": {
+          "queryReplacement": "={{ [$('Build draft request').item.json.email_id, $('Build draft request').item.json.jira_key, $json.choices[0].message.content] }}"
+        }
+      },
+      "id": "4fe0cbbd-30f0-5a5f-ac50-6d4d7bed6ec4",
+      "name": "Save draft (pending approval)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2660,
+        60
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ssi_callbacks (email_id, counterparty, flags, status)\nVALUES ($1, $2, $3::jsonb, 'PENDING_CALLBACK')\nON CONFLICT (email_id) DO NOTHING",
+        "options": {
+          "queryReplacement": "={{ [$json.email.email_id, $json.extraction.counterparty, JSON.stringify($json.decision.ssi_flags)] }}"
+        }
+      },
+      "id": "40acd505-258a-5a39-8a57-2f1584059aa3",
+      "name": "Queue SSI call-back",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "triage-bot@harborpeak.example",
+        "toEmail": "static-data@harborpeak.example",
+        "subject": "=SSI call-back needed: {{ $json.email.subject }}",
+        "emailFormat": "text",
+        "text": "=An email may change settlement or bank details. Do not action anything from the email itself.\n\nCall {{ $json.extraction.counterparty || 'the counterparty' }} back on the number already held in static data and confirm the change before touching SSIs.\n\nFrom: {{ $json.email.from_addr }}\nWhy it was flagged: {{ $json.decision.ssi_flags.join('; ') }}\nEmail id: {{ $json.email.email_id }}",
+        "options": {}
+      },
+      "id": "6b3eb126-d1ec-5b99-9f5f-0d32d39cd7e5",
+      "name": "Alert static data team",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1340,
+        440
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mo-smtp",
+          "name": "Internal SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO review_queue (email_id, reasons)\nVALUES ($1, $2::jsonb)\nON CONFLICT (email_id) DO NOTHING",
+        "options": {
+          "queryReplacement": "={{ [$json.email.email_id, JSON.stringify($json.decision.reasons)] }}"
+        }
+      },
+      "id": "7305a2ec-09ff-5227-9e57-9fc5b62a58bd",
+      "name": "Queue for human review",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        580
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "triage-postgres",
+          "name": "Triage Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "79480203-e8e9-5c37-9519-16eda28a6955",
+      "name": "FYI - no action",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1340,
+        720
+      ]
+    }
+  ],
+  "connections": {
+    "Shared mailbox (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Normalize email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize email": {
+      "main": [
+        [
+          {
+            "node": "Build OpenAI request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build OpenAI request": {
+      "main": [
+        [
+          {
+            "node": "OpenAI: classify + extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI: classify + extract": {
+      "main": [
+        [
+          {
+            "node": "Parse + controls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse + controls": {
+      "main": [
+        [
+          {
+            "node": "Save triage result",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Jira payload": {
+      "main": [
+        [
+          {
+            "node": "Jira: find open ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira: find open ticket": {
+      "main": [
+        [
+          {
+            "node": "Already open?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira: add comment": {
+      "main": [
+        [
+          {
+            "node": "Build draft request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira: create issue": {
+      "main": [
+        [
+          {
+            "node": "Build draft request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build draft request": {
+      "main": [
+        [
+          {
+            "node": "OpenAI: draft reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI: draft reply": {
+      "main": [
+        [
+          {
+            "node": "Save draft (pending approval)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already open?": {
+      "main": [
+        [
+          {
+            "node": "Jira: add comment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Jira: create issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Build Jira payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queue SSI call-back",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Alert static data team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queue for human review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "FYI - no action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "America/New_York"
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "middle-office"
+    },
+    {
+      "name": "triage"
+    }
+  ]
+}
